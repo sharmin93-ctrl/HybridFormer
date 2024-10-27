@@ -5,7 +5,7 @@ Implementation of [A CNN-Transformer Architecture for LDCT Image Denoising (Hybr
 * NVIDIA GeForce RTX 3080 series GPU
 
 ----
-### DATASET  (For downlodind the DATASET, please send a request to the link bellow) 
+### DATASET  (For downloding the DATASET, please send a request to the link bellow) 
 The 2016 NIH-AAPM-Mayo Clinic Low Dose CT Grand Challenge by Mayo Clinic   
 https://www.aapm.org/GrandChallenge/LowDoseCT/
 
