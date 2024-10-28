@@ -1,231 +1,281 @@
-import numpy as np
-import optim
-import torch
 import os
-from jinja2.compiler import F
-from timm import DnCNN
-from timm.layers import to_2tuple, DropPath, Mlp
-from timm.models.swin_transformer import WindowAttention, window_partition, window_reverse
-from torch import nn
-from torch.library import _
-from torch.utils.data import Dataset, DataLoader
-import cv2
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import sys
 
-class SwinTransformer:
-    pass
-class ResidualBlock(nn.Module):
-    def __init__(self,in_channles,num_channles,use_1x1conv=False,strides=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(
-            in_channles,num_channles,kernel_size=3,stride=strides,padding=1,)
-        self.conv2 = nn.Conv2d(
-            num_channles, num_channles, kernel_size=3, padding=1)
-        if use_1x1conv:
-            self.conv3=nn.Conv2d(
-                in_channles,num_channles,kernel_size=1,stride=strides)
-        else:
-            self.conv3=None
-        self.bn1=nn.BatchNorm2d(num_channles)
-        self.bn2=nn.BatchNorm2d(num_channles)
-        self.relu=nn.ReLU(inplace=True)
-    def forward(self,x):
-        y= F.relu(self.bn1(self.conv1(x)))
-        y=self.bn2(self.conv2(y))
-        if self.conv3:
-            x=self.conv3(x)
-        y+=x
-        return F.relu(y)
-blk=[]
-blk.append(ResidualBlock(64, 64,use_1x1conv=False, strides=1))
-blk.append(ResidualBlock(64, 128,use_1x1conv=True, strides=2))
-print(blk)
+# add dir
+from matplotlib import pyplot as plt
+from torch.optim import SGD
+import measure
+from dataset_denoise import get_training_data, get_validation_data
 
+from train.compound_loss import CompoundLoss
 
-class SwinTransformerBlock(nn.Module):
-    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
-                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.input_resolution = input_resolution
-        self.num_heads = num_heads
-        self.window_size = window_size
-        self.shift_size = shift_size
-        self.mlp_ratio = mlp_ratio
+dir_name = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(dir_name, '../dataset/'))
+sys.path.append(os.path.join(dir_name, '..'))
+print(sys.path)
+print(dir_name)
 
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+import argparse
+import options
 
-        self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        # DropPath（）
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)  # 线性层
+######### parser ###########
+opt = options.Options().init(argparse.ArgumentParser(description='Image denoising')).parse_args()
+print(opt)
 
-        # window
-        if self.shift_size > 0:
-            # calculate attention mask for SW-MSA
-            H, W = self.input_resolution
-            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+import utils
 
+######### Set GPUs ###########
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu
+import torch
 
-            h_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.shift_size),
-                        slice(-self.shift_size, None))
-            cnt = 0
-            for h in h_slices:
-                for w in w_slices:
-                    img_mask[:, h, w, :] = cnt
-                    cnt += 1
+torch.backends.cudnn.benchmark = True
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import random
+import time
+import numpy as np
+import datetime
+from measure import compute_PSNR
+from tqdm import tqdm
+from warmup_scheduler import GradualWarmupScheduler
+from torch.optim.lr_scheduler import StepLR
 
-            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
-            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)  # 把window展开成一行
-            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  #
-            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
-        else:
-            attn_mask = None
+######### Logs dir ###########
+log_dir = os.path.join(opt.save_dir, 'denoising', opt.dataset, opt.arch + opt.env)
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+now = time.strftime("%Y-%m-%d_%H_%M_%S", time.localtime())
+logname = os.path.join(log_dir, now + '.txt')
+print("Now time is : ", datetime.datetime.now().isoformat())
+result_dir = os.path.join(log_dir, 'results')
+model_dir = os.path.join(log_dir, 'models')
+utils.mkdir(result_dir)
+utils.mkdir(model_dir)
 
-        self.register_buffer("attn_mask", attn_mask)
+# ######### Set Seeds ###########
+random.seed(1234)
+np.random.seed(1234)
+torch.manual_seed(1234)
+torch.cuda.manual_seed_all(1234)
 
-    def forward(self, x):
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
+######### Model ###########
+model_restoration = utils.get_arch(opt)
 
-        shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
+with open(logname, 'a') as f:
+    f.write(str(opt) + '\n')
+    f.write(str(model_restoration) + '\n')
 
-        # cyclic shift
-        if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-        else:
-            shifted_x = x
+######### Optimizer ###########
+start_epoch = 1
+if opt.optimizer.lower() == 'adam':
+    optimizer = optim.Adam(model_restoration.parameters(), lr=opt.lr_initial, betas=(0.9, 0.999), eps=1e-8,
+                           weight_decay=opt.weight_decay)
+elif opt.optimizer.lower() == 'adamw':
+    optimizer = optim.AdamW(model_restoration.parameters(), lr=opt.lr_initial, betas=(0.9, 0.99), eps=1e-8,
+                            weight_decay=opt.weight_decay)
+elif opt.optimizer.lower() == 'nadm':
+    optimizer = optim.NAdam(model_restoration.parameters(), lr=opt.lr_initial, betas=(0.9, 0.99), eps=1e-8,
+                            weight_decay=opt.weight_decay)
+elif opt.optimizer.lower() == 'sgd':
+    optimizer = SGD(model_restoration.parameters(),
+                    lr=opt.lr_initial,
+                    momentum=0.9,
+                    dampening=0,
+                    weight_decay=opt.weight_decay,
+                    nesterov=False)
+else:
+    raise Exception("Error optimizer...")
 
-        # partition windows
-        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+######### DataParallel ###########
+model_restoration = torch.nn.DataParallel(model_restoration)
+model_restoration.cuda()
+######### Scheduler ###########
+if opt.warmup:
+    print("Using warmup and cosine strategy!")
+    warmup_epochs = opt.warmup_epochs
+    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, opt.nepoch - warmup_epochs, eta_min=1e-6)
+    scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=warmup_epochs,
+                                       after_scheduler=scheduler_cosine)
+    scheduler.step()
+else:
+    step = 50
+    print("Using StepLR,step={}!".format(step))
+    scheduler = StepLR(optimizer, step_size=step, gamma=0.5)
+    scheduler.step()
+######### Resume ###########
+if opt.resume:
+    path_chk_rest = opt.pretrain_weights
+    print("Resume from " + path_chk_rest)
+    utils.load_checkpoint(model_restoration, path_chk_rest)
+    start_epoch = utils.load_start_epoch(path_chk_rest) + 1
+    lr = utils.load_optim(optimizer, path_chk_rest)
 
-        # W-MSA/SW-MSA，mask是否为None用以区分采用W-MSA还是SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+    for i in range(1, start_epoch):
+        scheduler.step()
+    new_lr = scheduler.get_lr()[0]
+    print('------------------------------------------------------------------------------')
+    print("==> Resuming Training with learning rate:", new_lr)
+    print('------------------------------------------------------------------------------')
 
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+######### Loss ###########
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
-        else:
-            x = shifted_x
-        x = x.view(B, H * W, C)
+# criterion = MSELoss().cuda()
+# criterion = CharbonnierLoss().cuda()
+criterion = CompoundLoss()
+# criterion = nn.L1Loss()
 
-        # FFN
-        x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+######### DataLoader ###########
+print('===> Loading datasets')
+img_options_train = {'patch_size': opt.train_ps}
+train_dataset = get_training_data(opt.train_dir, img_options_train)
+train_loader = DataLoader(dataset=train_dataset, batch_size=opt.batch_size, shuffle=False,
+                          num_workers=opt.train_workers, pin_memory=True, drop_last=False)
+val_dataset = get_validation_data(opt.val_dir)
+val_loader = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False,
+                        num_workers=opt.eval_workers, pin_memory=True, drop_last=False)
 
-        return x
-
-
-
-class HybridFormer(nn.Module):
-    def __init__(self, in_channels, out_channels, num_conv_layers=17, scales=[2, 3, 4]):
-        super(HybridFormer, self).__init__()
-
-        num_channels = 64
-
-        # Define the model's parameters
-        self.scales = scales
-        self.residual_blocks = nn.ModuleList()
-        self.swin_transformers = nn.ModuleList()
-        self.convs = nn.ModuleList()
-
-        # Use a different multi-scale architecture
-        for scale in scales:
-            self.residual_blocks.append(nn.Sequential(
-                *[ResidualBlock(in_channels, num_channels) for _ in range(num_conv_layers)]
-            ))
-            self.swin_transformers.append(SwinTransformer(self, img_size=224 // scale, patch_size=4 // scale, window_size=8 // scale,
-                  embed_dim=96 // scale, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24],
-                  mlp_ratio=4, qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                  drop_path_rate=0.2, norm_layer=nn.LayerNorm, ape=False, patch_norm=True))
-            super().__init__()
-
-        self.convs.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
-
-    def forward(self, x):
-        outputs = []
-        for scale, residual_blocks, swin_transformer, conv in zip(self.scales, self.residual_blocks,
-                                                                  self.swin_transformers, self.convs):
-            identity = x
-
-            # Residual blocks
-            x = residual_blocks(x)
-
-            # Swin Transformer module
-            x = swin_transformer(x)
-
-            # DeepCNN layers
-            x = conv(x)
-
-            # Add residual connection
-            x += identity
-
-            outputs.append(x)
-
-        return outputs
+len_trainset = train_dataset.__len__()
+len_valset = val_dataset.__len__()
+print("Sizeof training set: ", len_trainset, ", sizeof validation set: ", len_valset)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, num_channles, use_1x1conv=False, strides=1, in_channles=None):
-        super(ResidualBlock, self).__init__()
+def denormalize_(image):
+    image = image * (3072.0 - -1024.0) + -1024.0
+    return image
 
-        self.conv1 = nn.Conv2d(in_channels, num_channles, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(in_channels, num_channles, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(in_channels)
 
-        if use_1x1conv:
-            self.conv3 = nn.Conv2d(in_channles, num_channles, kernel_size=1, stride=strides)
-        else:
-            self.conv3 = None
+def trunc(mat):
+    mat[mat <= -160] = -160
+    mat[mat >= 240] = 240
+    return mat
 
-    def forward(self, x):
-        residual = x
 
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
+def save_fig(x, y, pred, fig_name, original_result, pred_result):
+    x, y, pred = x.numpy(), y.numpy(), pred.numpy()  # 将Tensor变量转换为ndarray变量  Convert the Tensor variable to the ndarray variable
+    f, ax = plt.subplots(1, 3, figsize=(30, 10))
+    ax[0].imshow(x, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[0].set_title('Quarter-dose', fontsize=30)
+    ax[0].set_xlabel("PSNR: {:.4f}".format(original_result), fontsize=20)
+    ax[1].imshow(pred, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[1].set_title('Result', fontsize=30)
+    ax[1].set_xlabel("PSNR: {:.4f}".format(pred_result), fontsize=20)
+    ax[2].imshow(y, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[2].set_title('Full-dose', fontsize=30)
 
-        out += residual
-        out = self.relu(out)
+    plt.close()
 
-        return out
+######### train ###########
+print('===> Start Epoch {} End Epoch {}'.format(start_epoch, opt.nepoch))
+best_psnr = 0
+best_epoch = 0
+best_iter = 0
+eval_now = len(train_loader)
+print("\nEvaluation after every {} Iterations !!!\n".format(eval_now))
+lr_list = []  # 学习率存储数组  The learning rate storage array
+loss_list = []  # 损失存储数组  Loss storage array
+for epoch in range(start_epoch, opt.nepoch + 1):
+    epoch_start_time = time.time()
+    epoch_loss = 0
+    train_id = 1
+    model_restoration.train()
+    for i, data in enumerate(tqdm(train_loader), 0):
+        # zero_grad
+        optimizer.zero_grad()
 
-    class HybridFormer_DnCNN(nn.Module):
-        def __init__(self, upscale, img_size, window_size, img_range, depths, embed_dim, num_heads, mlp_ratio,
-                     upsampler):
-            super().__init__()
-            self.HybridFormer = HybridFormer(upscale=upscale, img_size=img_size, window_size=window_size,
-                                             img_range=img_range, depths=depths, embed_dim=embed_dim,
-                                             num_heads=num_heads,
-                                             mlp_ratio=mlp_ratio, upsampler=upsampler)
-            self.dncnn = DnCNN(in_channels=3, out_channels=3)
+        # target = data[0].float().cuda()
+        # input_ = data[1].float().cuda()
+        target = data[0].unsqueeze(0).float().cuda()
+        input_ = data[1].unsqueeze(0).float().cuda()
+        target = target.view(-1, 1, opt.train_ps, opt.train_ps)
+        input_ = input_.view(-1, 1, opt.train_ps, opt.train_ps)
+        # with torch.cuda.amp.autocast():
+        restored = model_restoration(input_)
+        loss = criterion(restored, target)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
 
-    def forward(self, x):
-        x = self.HybridFormer(x)
-        x = self.dncnn(x)
-        return x
+        # clear last step
+        optimizer.zero_grad()
+
+        # Evaluation ####
+        if (i + 1) % eval_now == 0 and i > 0 and epoch == 1:
+            with torch.no_grad():
+                model_restoration.eval()
+                psnr_val_rgb = []
+                for ii, (target, input_, targetImagePath, inputImagePath) in enumerate(tqdm(val_loader), 0):
+                    shape_ = input_.shape[-1]
+                    input_ = input_.float().cuda()
+                    target = target.float().cuda()
+
+                    # with torch.cuda.amp.autocast():
+                    restored = model_restoration(input_)
+                    input_ = trunc(denormalize_(input_.view(shape_, shape_).cpu().detach()))
+                    target = trunc(denormalize_(target.view(shape_, shape_).cpu().detach()))
+                    restored = trunc(denormalize_(restored.view(shape_, shape_).cpu().detach()))
+                    pred_result = measure.compute_PSNR(restored, target, 400)
+                    original_result = measure.compute_PSNR(input_, target, 400)
+                    psnr_val_rgb.append(compute_PSNR(restored, target, 400))
+                    save_fig(input_, target, restored, ii, original_result, pred_result)
+                psnr_val_rgb = sum(psnr_val_rgb) / len_valset
+
+                if psnr_val_rgb > best_psnr:
+                    best_psnr = psnr_val_rgb
+                    best_epoch = epoch
+                    best_iter = i
+                    torch.save({'epoch': epoch,
+                                'state_dict': model_restoration.state_dict(),
+                                'optimizer': optimizer.state_dict()
+                                }, os.path.join(model_dir, "model_best.pth"))
+                    # torch.save(model_restoration.state_dict(), os.path.join(model_dir, "model_best.pth"))
+                print(
+                    "[Ep %d it %d\t PSNR SIDD: %.4f\t] ----  [best_Ep_SIDD %d best_it_SIDD %d Best_PSNR_SIDD %.4f] " % (
+                        epoch, i, psnr_val_rgb, best_epoch, best_iter, best_psnr))
+                with open(logname, 'a') as f:
+                    f.write(
+                        "[Ep %d it %d\t PSNR SIDD: %.4f\t] ----  [best_Ep_SIDD %d best_it_SIDD %d Best_PSNR_SIDD %.4f] " \
+                        % (epoch, i, psnr_val_rgb, best_epoch, best_iter, best_psnr) + '\n')
+                model_restoration.train()
+                torch.cuda.empty_cache()
+    loss_list.append(epoch_loss)  # 插入每次训练的损失值  Insert the loss value of each training
+    lr_list.append(scheduler.get_lr())
+    scheduler.step()
+
+    print("------------------------------------------------------------------")
+    print("Epoch: {}\tTime: {:.4f}\tLoss: {:.4f}\tLearningRate {:.6f}".format(epoch, time.time() - epoch_start_time,
+                                                                              epoch_loss, scheduler.get_lr()[0]))
+    print("------------------------------------------------------------------")
+    with open(logname, 'a') as f:
+        f.write(
+            "Epoch: {}\tTime: {:.4f}\tLoss: {:.4f}\tLearningRate {:.6f}".format(epoch, time.time() - epoch_start_time,
+                                                                                epoch_loss,
+                                                                                scheduler.get_lr()[0]) + '\n')
+
+    torch.save({'epoch': epoch,
+                'state_dict': model_restoration.state_dict(),
+                'optimizer': optimizer.state_dict()
+                }, os.path.join(model_dir, "model_latest.pth"))
+    if epoch % opt.checkpoint == 0:
+        torch.save({'epoch': epoch,
+                    'state_dict': model_restoration.state_dict(),
+                    'optimizer': optimizer.state_dict()
+                    }, os.path.join(model_dir, "model_epoch_{}.pth".format(epoch)))
+print("Now time is : ", datetime.datetime.now().isoformat())
+
+# 绘制训练时损失曲线
+plt.figure(1)
+x = range(0, opt.nepoch)
+plt.xlabel('epoch')
+plt.ylabel('epoch loss')
+plt.plot(x, loss_list, 'r-')
+# 绘制学习率改变曲线
+plt.figure(2)
+plt.xlabel('epoch')
+plt.ylabel('learning rate')
+plt.plot(x, lr_list, 'r-')
+
+plt.show()
