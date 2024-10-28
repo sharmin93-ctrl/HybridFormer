@@ -28,19 +28,19 @@ parser = argparse.ArgumentParser(description='RGB denoising evaluation on the va
 parser.add_argument('--input_dir', default='./datasets/AAPM/test',
                     type=str, help='Directory of validation images')
 parser.add_argument('--result_dir',
-                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/结果图/',
+                    default='./logs/denoising/AAPM/Hformer_B_convt_se/results/结果图/',
                     type=str, help='Directory for results')
 parser.add_argument('--comparison_dir',
-                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/对比图/',
+                    default='./logs/denoising/AAPM/Hformer_B_convt_se/results/对比图/',
                     type=str, help='Directory for results')
 parser.add_argument('--NDCT_dir',
-                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/NDCT/',
+                    default='./logs/denoising/AAPM/Hformer_B_convt_se/results/NDCT/',
                     type=str, help='Directory for results')
 parser.add_argument('--LDCT_dir',
-                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/LDCT/',
+                    default='./logs/denoising/AAPM/Hformer_B_convt_se/results/LDCT/',
                     type=str, help='Directory for results')
 parser.add_argument('--weights',
-                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/models/model_latest.pth',
+                    default='./logs/denoising/AAPM/Hformer_B_convt_se/models/model_latest.pth',
                     type=str, help='Path to weights')
 
 parser.add_argument('--transform', type=bool, default=False)
