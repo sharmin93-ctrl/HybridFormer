@@ -1,0 +1,192 @@
+import io
+import time
+import numpy as np
+import os, sys
+import argparse
+
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+
+import torch.nn as nn
+import torch
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+
+import measure
+# from dataset.dataset_denoise import DataLoaderVal
+from torch.utils.data import DataLoader
+
+from dataset import DataLoaderVal
+from measure import compute_PSNR, compute_SSIM
+
+sys.path.append('/home/wangzd/uformer/')
+
+import utils
+
+
+parser = argparse.ArgumentParser(description='RGB denoising evaluation on the validation set of SIDD')
+parser.add_argument('--input_dir', default='./datasets/AAPM/test',
+                    type=str, help='Directory of validation images')
+parser.add_argument('--result_dir',
+                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/结果图/',
+                    type=str, help='Directory for results')
+parser.add_argument('--comparison_dir',
+                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/对比图/',
+                    type=str, help='Directory for results')
+parser.add_argument('--NDCT_dir',
+                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/NDCT/',
+                    type=str, help='Directory for results')
+parser.add_argument('--LDCT_dir',
+                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/results/LDCT/',
+                    type=str, help='Directory for results')
+parser.add_argument('--weights',
+                    default='./logs/denoising/AAPM/RSTNet_B_convt_se/models/model_latest.pth',
+                    type=str, help='Path to weights')
+
+parser.add_argument('--transform', type=bool, default=False)
+parser.add_argument('--trainortest', type=str, default='test')
+parser.add_argument('--load_mode', type=int, default=0)
+# parser.add_argument('--train_path', type=str, default='./data/train/')
+# parser.add_argument('--val_path', type=str, default='./data/val/')
+parser.add_argument('--test_path', type=str, default='./data/test/')
+
+parser.add_argument('--gpus', default='0', type=str, help='CUDA_VISIBLE_DEVICES')
+parser.add_argument('--arch', default='RSTNet_B_conv', type=str, help='arch')
+parser.add_argument('--batch_size', default=1, type=int, help='Batch size for dataloader')
+parser.add_argument('--save_images', action='store_true', help='Save denoised images in result directory')
+parser.add_argument('--embed_dim', type=int, default=32, help='number of data loading workers')
+parser.add_argument('--win_size', type=int, default=8, help='number of data loading workers')
+parser.add_argument('--token_projection', type=str, default='linear', help='linear/conv token projection')
+parser.add_argument('--token_mlp', type=str, default='', help='ffn/leff token mlp')
+parser.add_argument('--dd_in', type=int, default=1, help='dd_in')
+# args for vit
+parser.add_argument('--vit_dim', type=int, default=256, help='vit hidden_dim')
+parser.add_argument('--vit_depth', type=int, default=12, help='vit depth')
+parser.add_argument('--vit_nheads', type=int, default=8, help='vit hidden_dim')
+parser.add_argument('--vit_mlp_dim', type=int, default=512, help='vit mlp_dim')
+parser.add_argument('--vit_patch_size', type=int, default=16, help='vit patch_size')
+parser.add_argument('--global_skip', action='store_true', default=False, help='global skip connection')
+parser.add_argument('--local_skip', action='store_true', default=False, help='local skip connection')
+parser.add_argument('--vit_share', action='store_true', default=False, help='share vit module')
+
+parser.add_argument('--train_ps', type=int, default=64, help='patch size of training sample')
+args = parser.parse_args()
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+utils.mkdir(args.result_dir)
+utils.mkdir(args.comparison_dir)
+utils.mkdir(args.NDCT_dir)
+utils.mkdir(args.LDCT_dir)
+
+
+# def get_validation_data(rgb_dir):
+#     assert os.path.exists(rgb_dir)
+#     return DataLoaderVal(rgb_dir, None)
+
+
+test_dataset = DataLoaderVal(args.input_dir)
+test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
+
+model_restoration = utils.get_arch(args)
+model_restoration = torch.nn.DataParallel(model_restoration)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# model_restoration.load_state_dict(torch.load(args.weights))
+utils.load_checkpoint(model_restoration, args.weights)
+# model_restoration.load_state_dict(torch.load(args.weights), False)
+print("===>Testing using weights: ", args.weights)
+
+model_restoration.cuda()
+model_restoration.eval()
+
+
+def denormalize_(image):
+    image = image * (3072.0 - -1024.0) + -1024.0
+    return image
+
+
+def trunc(mat):
+    mat[mat <= -160] = -160
+    mat[mat >= 240] = 240
+    return mat
+
+
+def save_fig(x, y, pred, fig_name, original_result, pred_result, original_ssim, pred_ssim):
+    x, y, pred = x.numpy(), y.numpy(), pred.numpy()  # 将Tensor变量转换为ndarray变量
+    f, ax = plt.subplots(1, 3, figsize=(30, 10))
+    ax[0].imshow(x, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[0].set_title('Quarter-dose', fontsize=30)
+    ax[0].set_xlabel("PSNR: {:.4f}\nSSIM: {:.4f}".format(original_result, original_ssim), fontsize=20)
+    ax[1].imshow(pred, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[1].set_title('Result', fontsize=30)
+    ax[1].set_xlabel("PSNR: {:.4f}\nSSIM: {:.4f}".format(pred_result, pred_ssim), fontsize=20)
+    ax[2].imshow(y, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    ax[2].set_title('Full-dose', fontsize=30)
+    f.savefig(os.path.join(args.comparison_dir, 'result_{}.png'.format(fig_name)))
+
+    f1, ax1 = plt.subplots(1, 1, figsize=(10, 10))
+    plt.axis('off')  # 去坐标轴
+    plt.xticks([]), plt.yticks([])  # 去除坐标轴
+    ax1.imshow(pred, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    f1.savefig(os.path.join(args.result_dir, 'result_{}.png'.format(fig_name)), bbox_inches='tight', pad_inches=-0.1)
+
+    f2, ax2 = plt.subplots(1, 1, figsize=(10, 10))
+    plt.axis('off')  # 去坐标轴
+    plt.xticks([]), plt.yticks([])  # 去除坐标轴
+    ax2.imshow(y, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    f2.savefig(os.path.join(args.NDCT_dir, 'result{}.png'.format(fig_name)), bbox_inches='tight', pad_inches=-0.1)
+
+    f3, ax3 = plt.subplots(1, 1, figsize=(10, 10))
+    plt.axis('off')  # 去坐标轴
+    plt.xticks([]), plt.yticks([])  # 去除坐标轴
+    ax3.imshow(x, cmap=plt.cm.gray, vmin=-160, vmax=240)
+    f3.savefig(os.path.join(args.LDCT_dir, 'result{}.png'.format(fig_name)), bbox_inches='tight', pad_inches=-0.1)
+    plt.close()
+
+
+with torch.no_grad():
+    psnr_val_rgb = []
+    ssim_val_rgb = []
+    fsim_val_rgb = []
+    psnr_ori_rgb = []
+    ssim_ori_rgb = []
+    fsim_ori_rgb = []
+    # for ii, data_test in enumerate(tqdm(test_loader), 0):
+    for ii, (target, input_, targetImagePath, inputImagePath) in enumerate(tqdm(test_loader), 0):
+        shape_ = input_.shape[-1]
+        input_ = input_.float().cuda()
+        target = target.float().cuda()
+
+        restored = model_restoration(input_)
+        a = inputImagePath[0]
+        print(a)
+        # print(a)
+        input_ = trunc(denormalize_(input_.view(shape_, shape_).cpu().detach()))
+        target = trunc(denormalize_(target.view(shape_, shape_).cpu().detach()))
+        restored = trunc(denormalize_(restored.view(shape_, shape_).cpu().detach()))
+
+        pred_result = compute_PSNR(restored, target, 400)
+        original_result = compute_PSNR(input_, target, 400)
+
+        pred_ssim = compute_SSIM(restored, target, 400)
+        original_ssim = compute_SSIM(input_, target, 400)
+
+
+        psnr_val_rgb.append(compute_PSNR(restored, target, 400))
+        ssim_val_rgb.append(compute_SSIM(restored, target, 400))
+        psnr_ori_rgb.append(compute_PSNR(input_, target, 400))
+        ssim_ori_rgb.append(compute_SSIM(input_, target, 400))
+
+        save_fig(input_, target, restored, ii, original_result, pred_result, original_ssim, pred_ssim)
+
+    psnr_val_rgb = sum(psnr_val_rgb) / len(test_dataset)
+    ssim_val_rgb = sum(ssim_val_rgb) / len(test_dataset)
+    fsim_val_rgb = sum(fsim_ori_rgb) / len(test_dataset)
+
+    psnr_ori_rgb = sum(psnr_ori_rgb) / len(test_dataset)
+    ssim_ori_rgb = sum(ssim_ori_rgb) / len(test_dataset)
+    fsim_ori_rgb = sum(fsim_ori_rgb) / len(test_dataset)
+
+    print("val_PSNR: %f, val_SSIM: %f, val_RMSE: %f " % (psnr_val_rgb, ssim_val_rgb, fsim_val_rgb))
+    print("ori_PSNR: %f, ori_SSIM: %f, ori_RMSE: %f " % (psnr_ori_rgb, ssim_ori_rgb, fsim_ori_rgb))
