@@ -8,7 +8,7 @@ Implementation of [A CNN-Transformer Architecture for LDCT Image Denoising (Hybr
 ----
 ### DATASET  (For downloding the DATASET, please visit the link bellow) 
 The 2016 NIH-AAPM-Mayo Clinic Low Dose CT Grand Challenge by Mayo Clinic   
-https://www.aapm.org/GrandChallenge/LowDoseCT/ and to download the dataset please visit : https://aapm.app.box.com/s/eaw4jddb53keg1bptavvvd1sf4x3pe9h
+[https://www.aapm.org/GrandChallenge/LowDoseCT/](https://ctcicblog.mayo.edu/2016-low-dose-ct-grand-challenge/) and to download the dataset please visit : https://aapm.app.box.com/s/eaw4jddb53keg1bptavvvd1sf4x3pe9h
 
 The `data path` structure:
 
