@@ -3,6 +3,7 @@ Implementation of [A CNN-Transformer Architecture for LDCT Image Denoising (Hybr
 * The input image patch(64x64 size) is extracted randomly from the 512x512 size image. --> 
 * use Adam optimizer
 * NVIDIA GeForce RTX 3080 series GPU
+* [DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15094096.svg)](https://doi.org/10.5281/zenodo.15094096)
 
 ----
 ### DATASET  (For downloding the DATASET, please visit the link bellow) 
