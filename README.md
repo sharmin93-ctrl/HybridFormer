@@ -1,5 +1,5 @@
 # Hybrid Former
-Implementation of [A CNN-Transformer Architecture for LDCT Image Denoising (Hybrid Former)] 
+Implementation of [ A Convolutional Neural Network -Transformer Architecture for Low Dose Computed Tomography Image Denoising (Hybrid Former)] 
 * The input image patch(64x64 size) is extracted randomly from the 512x512 size image. --> 
 * use Adam optimizer
 * NVIDIA GeForce RTX 3080 series GPU
